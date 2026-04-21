@@ -8,6 +8,7 @@ import csv
 from pathlib import Path
 from datetime import datetime
 
+import re
 import time
 
 import click
@@ -85,6 +86,17 @@ def get_groq_client():
     return Groq(api_key=api_key)
 
 
+def _parse_retry_after(error_msg):
+    """Extract wait seconds from Groq rate limit error message."""
+    m = re.search(r"try again in (\d+)m\s*([\d.]+)s", error_msg)
+    if m:
+        return int(m.group(1)) * 60 + int(float(m.group(2))) + 5
+    m = re.search(r"try again in ([\d.]+)s", error_msg)
+    if m:
+        return int(float(m.group(1))) + 5
+    return 60  # fallback
+
+
 def generate_brief(keyword, audience, content_type, word_count, model, max_retries=5):
     client = get_groq_client()
     prompt = BRIEF_PROMPT.format(
@@ -113,10 +125,10 @@ def generate_brief(keyword, audience, content_type, word_count, model, max_retri
                     max_tokens=4096,
                 )
             return response.choices[0].message.content
-        except RateLimitError:
+        except RateLimitError as e:
             if attempt == max_retries - 1:
                 raise
-            wait = 2 ** attempt * 10  # 10s, 20s, 40s, 80s
+            wait = _parse_retry_after(str(e))
             console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
             time.sleep(wait)
 
