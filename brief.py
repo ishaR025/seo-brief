@@ -8,9 +8,11 @@ import csv
 from pathlib import Path
 from datetime import datetime
 
+import time
+
 import click
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, RateLimitError
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
@@ -83,7 +85,7 @@ def get_groq_client():
     return Groq(api_key=api_key)
 
 
-def generate_brief(keyword, audience, content_type, word_count, model):
+def generate_brief(keyword, audience, content_type, word_count, model, max_retries=5):
     client = get_groq_client()
     prompt = BRIEF_PROMPT.format(
         keyword=keyword,
@@ -92,24 +94,31 @@ def generate_brief(keyword, audience, content_type, word_count, model):
         word_count=word_count,
     )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        transient=True,
-        console=console,
-    ) as progress:
-        progress.add_task(f"Generating brief for '{keyword}'...", total=None)
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-            max_tokens=4096,
-        )
-
-    return response.choices[0].message.content
+    for attempt in range(max_retries):
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=True,
+                console=console,
+            ) as progress:
+                progress.add_task(f"Generating brief for '{keyword}'...", total=None)
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.7,
+                    max_tokens=4096,
+                )
+            return response.choices[0].message.content
+        except RateLimitError:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt * 10  # 10s, 20s, 40s, 80s
+            console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
+            time.sleep(wait)
 
 
 def save_brief(content, keyword, output_dir):
@@ -258,18 +267,25 @@ def batch(csv_file, output_dir, model, words, priority, cluster, dry_run):
             console.print(f"  [cyan]{row.get('Keyword')}[/cyan] — {row.get('Cluster')} / {row.get('Intent')} / {row.get('Priority')}")
         return
 
-    success, failed = 0, []
+    success, skipped, failed = 0, 0, []
     for i, row in enumerate(rows, 1):
         keyword = row.get("Keyword", "").strip()
         kw_cluster = row.get("Cluster", "Unclustered").strip()
         intent = row.get("Intent", "informational").strip().lower()
         content_type = INTENT_TO_CONTENT_TYPE.get(intent, "blog post")
+        cluster_slug = kw_cluster.lower().replace(" ", "-").replace("/", "-")
+        slug = keyword.lower().replace(" ", "-").replace("/", "-")
+
+        existing = list(Path(output_dir, cluster_slug).glob(f"brief-{slug}-*.md"))
+        if existing:
+            console.print(f"\n[{i}/{len(rows)}] [dim]Skipping '{keyword}' — brief already exists[/dim]")
+            skipped += 1
+            continue
 
         console.print(f"\n[{i}/{len(rows)}] [bold]{keyword}[/bold] ({kw_cluster} · {content_type})")
 
         try:
             brief_content = generate_brief(keyword, "general audience", content_type, words, model)
-            cluster_slug = kw_cluster.lower().replace(" ", "-").replace("/", "-")
             path = save_brief(brief_content, keyword, str(Path(output_dir) / cluster_slug))
             console.print(f"  [green]Saved:[/green] {path}")
             success += 1
@@ -277,7 +293,7 @@ def batch(csv_file, output_dir, model, words, priority, cluster, dry_run):
             console.print(f"  [red]Failed:[/red] {e}")
             failed.append(keyword)
 
-    console.print(f"\n[bold]Done.[/bold] {success} saved, {len(failed)} failed.")
+    console.print(f"\n[bold]Done.[/bold] {success} saved, {skipped} skipped, {len(failed)} failed.")
     if failed:
         console.print("[red]Failed keywords:[/red] " + ", ".join(failed))
 
