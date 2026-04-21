@@ -1,0 +1,8 @@
+brief.py
+setup.py
+seo_brief.egg-info/PKG-INFO
+seo_brief.egg-info/SOURCES.txt
+seo_brief.egg-info/dependency_links.txt
+seo_brief.egg-info/entry_points.txt
+seo_brief.egg-info/requires.txt
+seo_brief.egg-info/top_level.txt
