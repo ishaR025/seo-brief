@@ -4,6 +4,7 @@
 import os
 import sys
 import json
+import csv
 from pathlib import Path
 from datetime import datetime
 
@@ -183,6 +184,102 @@ def generate(keyword, audience, content_type, words, model, save, output_dir, as
     if save:
         path = save_brief(brief_content, keyword, output_dir)
         console.print(f"\n[green]Saved:[/green] {path}")
+
+
+INTENT_TO_CONTENT_TYPE = {
+    "informational": "guide",
+    "commercial": "comparison",
+    "transactional": "product page",
+    "navigational": "landing page",
+}
+
+
+@cli.command()
+@click.argument("csv_file", type=click.Path(exists=True))
+@click.option("--output-dir", "-o", default="./briefs", show_default=True,
+              help="Root directory to save briefs (subfolders created per cluster).")
+@click.option("--model", "-m", default="llama-3.3-70b-versatile", show_default=True,
+              help="Groq model to use.")
+@click.option("--words", "-w", default=1500, show_default=True,
+              help="Target word count for each brief.")
+@click.option("--priority", "-p", type=click.Choice(["high", "medium", "low"], case_sensitive=False),
+              default=None, help="Only process keywords with this priority.")
+@click.option("--cluster", "-c", default=None,
+              help="Only process keywords in this cluster (partial match, case-insensitive).")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Preview rows that would be processed without generating briefs.")
+def batch(csv_file, output_dir, model, words, priority, cluster, dry_run):
+    """Generate briefs for all keywords in CSV_FILE.
+
+    \b
+    Expected columns: Keyword, Cluster, Intent, Priority, Funnel Stage, Rationale
+    Briefs are saved as Markdown files under OUTPUT_DIR/<cluster>/.
+
+    \b
+    Examples:
+      brief batch keywords.csv
+      brief batch keywords.csv --priority high
+      brief batch keywords.csv --cluster "AI Sales Roleplay"
+      brief batch keywords.csv --dry-run
+    """
+    rows = []
+    with open(csv_file, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            kw = row.get("Keyword", "").strip()
+            if not kw:
+                continue
+            kw_priority = row.get("Priority", "").strip().lower()
+            kw_cluster = row.get("Cluster", "").strip()
+            if priority and kw_priority != priority.lower():
+                continue
+            if cluster and cluster.lower() not in kw_cluster.lower():
+                continue
+            rows.append(row)
+
+    if not rows:
+        console.print("[yellow]No rows matched the given filters.[/yellow]")
+        return
+
+    console.print(Panel(
+        f"[bold]CSV:[/bold] {csv_file}\n"
+        f"[bold]Keywords:[/bold] {len(rows)}\n"
+        f"[bold]Model:[/bold] {model}\n"
+        f"[bold]Output:[/bold] {output_dir}" +
+        (f"\n[bold]Priority filter:[/bold] {priority}" if priority else "") +
+        (f"\n[bold]Cluster filter:[/bold] {cluster}" if cluster else ""),
+        title="[cyan]SEO Batch Brief Generator[/cyan]",
+        border_style="cyan",
+    ))
+
+    if dry_run:
+        console.print("\n[bold]Rows to be processed:[/bold]")
+        for row in rows:
+            console.print(f"  [cyan]{row.get('Keyword')}[/cyan] — {row.get('Cluster')} / {row.get('Intent')} / {row.get('Priority')}")
+        return
+
+    success, failed = 0, []
+    for i, row in enumerate(rows, 1):
+        keyword = row.get("Keyword", "").strip()
+        kw_cluster = row.get("Cluster", "Unclustered").strip()
+        intent = row.get("Intent", "informational").strip().lower()
+        content_type = INTENT_TO_CONTENT_TYPE.get(intent, "blog post")
+
+        console.print(f"\n[{i}/{len(rows)}] [bold]{keyword}[/bold] ({kw_cluster} · {content_type})")
+
+        try:
+            brief_content = generate_brief(keyword, "general audience", content_type, words, model)
+            cluster_slug = kw_cluster.lower().replace(" ", "-").replace("/", "-")
+            path = save_brief(brief_content, keyword, str(Path(output_dir) / cluster_slug))
+            console.print(f"  [green]Saved:[/green] {path}")
+            success += 1
+        except Exception as e:
+            console.print(f"  [red]Failed:[/red] {e}")
+            failed.append(keyword)
+
+    console.print(f"\n[bold]Done.[/bold] {success} saved, {len(failed)} failed.")
+    if failed:
+        console.print("[red]Failed keywords:[/red] " + ", ".join(failed))
 
 
 @cli.command()
