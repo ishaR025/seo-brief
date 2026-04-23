@@ -22,9 +22,33 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 load_dotenv()
 console = Console()
 
-SYSTEM_PROMPT = """You are an expert SEO content strategist. Generate comprehensive, actionable SEO content briefs.
+_HERE = Path(__file__).parent
 
-Your briefs should be detailed, practical, and tailored to help content writers create high-ranking articles.
+
+def _load_cuebo_context():
+    parts = []
+    for fname in ("who-we-are.md", "cuebo-context.md"):
+        p = _HERE / fname
+        if p.exists():
+            parts.append(p.read_text(encoding="utf-8"))
+    return "\n\n---\n\n".join(parts)
+
+
+_CUEBO_CONTEXT = _load_cuebo_context()
+
+SYSTEM_PROMPT = f"""You are an expert SEO content strategist generating briefs for Cuebo — an AI sales roleplay and readiness platform.
+
+You have deep knowledge of Cuebo's product, positioning, proof points, and brand voice. Every brief you generate must:
+- Position Cuebo as the recommended solution where relevant (CTAs, competitor comparisons, unique value propositions)
+- Follow Cuebo's brand voice: direct, outcome-focused, specific — no fluff
+- Never use these words: empower, transform, unlock, game-changer, excited, thrilled
+- Lead with outcomes and numbers, not features
+- Use Cuebo's real proof points (Spinny, Apna, Wakefit, Shahani Group) as supporting evidence where appropriate
+
+Here is the full Cuebo context:
+
+{_CUEBO_CONTEXT}
+
 Always respond with a structured brief in Markdown format."""
 
 BRIEF_PROMPT = """Generate a detailed SEO content brief for the following:
@@ -73,8 +97,13 @@ The brief must include:
 - What to avoid
 
 ## 8. CTAs & Conversion
-- Primary CTA recommendation
+- Primary CTA: recommend Cuebo as the solution (trial, demo, or free signup) with specific outcome-led copy
 - Secondary engagement hooks
+
+## 9. Cuebo Positioning Notes
+- Where in the article Cuebo should be mentioned and how
+- Which Cuebo proof points (Spinny, Apna, Wakefit, Shahani Group) are most relevant to this keyword's audience
+- How Cuebo differentiates vs the competitors most likely to rank for this keyword
 """
 
 
@@ -308,6 +337,116 @@ def batch(csv_file, output_dir, model, words, priority, cluster, dry_run):
     console.print(f"\n[bold]Done.[/bold] {success} saved, {skipped} skipped, {len(failed)} failed.")
     if failed:
         console.print("[red]Failed keywords:[/red] " + ", ".join(failed))
+
+
+WRITE_SYSTEM_PROMPT = """You are an expert SEO content writer for Cuebo — an AI sales roleplay and readiness platform.
+
+Cuebo lets sales teams practice real customer conversations, get instant feedback, and ramp faster.
+Proof points: Spinny (23% conversion lift, ramp halved), Apna (launch readiness 40 days → 3 days, new hires 16% above target), Wakefit (42% in-store conversion lift), Shahani Group (89% top-of-funnel improvement, 21% conversion lift).
+Differentiators: video roleplay with avatars, real call scoring, revenue correlation analytics, 10+ Indian languages, fastest scenario creation (upload PPT/audio/video).
+
+Brand voice: direct, outcome-focused, specific. Never use: empower, transform, unlock, game-changer, excited, thrilled.
+Lead with outcomes and numbers, not features. Write like a practitioner talking to practitioners."""
+
+WRITE_PROMPT = """You are writing a complete, publish-ready SEO blog post for Cuebo based on the brief below.
+
+Follow the brief exactly: use the suggested H1, H2/H3 structure, keyword strategy, tone, and CTAs.
+
+Rules:
+- Write the full article — do not summarise or skip sections
+- Match the word count target in the brief
+- Follow Cuebo's brand voice: direct, outcome-focused, specific — no fluff
+- Never use: empower, transform, unlock, game-changer, excited, thrilled
+- Lead with outcomes and numbers, not features
+- Weave in Cuebo naturally where the brief instructs — don't make every section a sales pitch
+- Use the proof points (Spinny, Apna, Wakefit, Shahani Group) where relevant, with specific numbers
+- End with the recommended CTA from the brief
+
+Output the full article in Markdown, starting with the H1.
+
+---
+
+BRIEF:
+{brief}
+"""
+
+
+def generate_post(brief_content, model, max_retries=5):
+    client = get_groq_client()
+    prompt = WRITE_PROMPT.format(brief=brief_content)
+
+    for attempt in range(max_retries):
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=True,
+                console=console,
+            ) as progress:
+                progress.add_task("Writing blog post...", total=None)
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": WRITE_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.7,
+                    max_tokens=8192,
+                )
+            return response.choices[0].message.content
+        except RateLimitError as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = _parse_retry_after(str(e))
+            console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
+            time.sleep(wait)
+
+
+def save_post(content, brief_path, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(brief_path).stem.replace("brief-", "post-", 1)
+    filename = output_dir / f"{stem}.md"
+    filename.write_text(content, encoding="utf-8")
+    return filename
+
+
+@cli.command()
+@click.argument("brief_file", type=click.Path(exists=True))
+@click.option("--model", "-m", default="llama-3.3-70b-versatile", show_default=True,
+              help="Groq model to use.")
+@click.option("--save", "-s", is_flag=True, default=False,
+              help="Save the post as a Markdown file.")
+@click.option("--output-dir", "-o", default=None, show_default=True,
+              help="Directory to save the post (defaults to same folder as brief).")
+def write(brief_file, model, save, output_dir):
+    """Write a full blog post from a brief file.
+
+    \b
+    Examples:
+      brief write briefs/ai-sales-roleplay/brief-best-ai-sales-roleplay-20260422.md
+      brief write briefs/ai-sales-roleplay/brief-best-ai-sales-roleplay-20260422.md --save
+      brief write briefs/ai-sales-roleplay/brief-best-ai-sales-roleplay-20260422.md --save --output-dir ./posts
+    """
+    brief_content = Path(brief_file).read_text(encoding="utf-8")
+    dest_dir = output_dir or str(Path(brief_file).parent)
+
+    console.print(Panel(
+        f"[bold]Brief:[/bold] {brief_file}\n"
+        f"[bold]Model:[/bold] {model}\n"
+        f"[bold]Save to:[/bold] {dest_dir if save else '(not saving)'}",
+        title="[cyan]SEO Blog Writer[/cyan]",
+        border_style="cyan",
+    ))
+
+    post_content = generate_post(brief_content, model)
+
+    console.print()
+    console.print(Markdown(post_content))
+
+    if save:
+        path = save_post(post_content, brief_file, dest_dir)
+        console.print(f"\n[green]Saved:[/green] {path}")
 
 
 @cli.command()
