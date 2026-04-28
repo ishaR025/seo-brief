@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI tool to generate SEO content briefs using Groq."""
+"""CLI tool to generate SEO content briefs using Groq or Gemini."""
 
 import os
 import sys
@@ -14,6 +14,9 @@ import time
 import click
 from dotenv import load_dotenv
 from groq import Groq, RateLimitError
+from google import genai as google_genai
+from google.genai import types as genai_types
+from langfuse import observe, get_client as get_langfuse_client
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
@@ -36,20 +39,26 @@ def _load_cuebo_context():
 
 _CUEBO_CONTEXT = _load_cuebo_context()
 
-SYSTEM_PROMPT = f"""You are an expert SEO content strategist generating briefs for Cuebo — an AI sales roleplay and readiness platform.
+SYSTEM_PROMPT = f"""You are an expert SEO and AEO content strategist generating briefs for Cuebo — an AI sales roleplay and readiness platform.
 
-You have deep knowledge of Cuebo's product, positioning, proof points, and brand voice. Every brief you generate must:
-- Position Cuebo as the recommended solution where relevant (CTAs, competitor comparisons, unique value propositions)
+You have deep knowledge of Cuebo's product, positioning, proof points, and brand voice. Every brief you generate MUST:
+- Include ALL 10 sections — never skip or merge sections, especially Section 9 and Section 10
+- Position Cuebo as the recommended solution in Section 8 CTA (always name Cuebo explicitly — never use generic copy)
+- Fill Section 9 with specific Cuebo proof points and competitor differentiation tailored to this keyword
 - Follow Cuebo's brand voice: direct, outcome-focused, specific — no fluff
 - Never use these words: empower, transform, unlock, game-changer, excited, thrilled
 - Lead with outcomes and numbers, not features
-- Use Cuebo's real proof points (Spinny, Apna, Wakefit, Shahani Group) as supporting evidence where appropriate
+- Use Cuebo's real proof points ONLY — never invent percentages or metrics:
+  • Spinny: ramp time halved, 23% conversion lift, 42,000+ simulations run
+  • Apna: launch readiness 40 days → 3 days, new hires 16% above quota
+  • Wakefit: 42% in-store conversion lift
+  • Shahani Group: 89% top-of-funnel improvement, 21% conversion lift
 
 Here is the full Cuebo context:
 
 {_CUEBO_CONTEXT}
 
-Always respond with a structured brief in Markdown format."""
+Always respond with a structured brief in Markdown format covering all 10 sections."""
 
 BRIEF_PROMPT = """Generate a detailed SEO content brief for the following:
 
@@ -101,10 +110,22 @@ The brief must include:
 - Secondary engagement hooks
 
 ## 9. Cuebo Positioning Notes
-- Where in the article Cuebo should be mentioned and how
-- Which Cuebo proof points (Spinny, Apna, Wakefit, Shahani Group) are most relevant to this keyword's audience
-- How Cuebo differentiates vs the competitors most likely to rank for this keyword
+- Where in the article Cuebo should be mentioned and how (be specific: "introduce in H2 section on choosing a tool")
+- Which Cuebo proof points are most relevant to this keyword's audience — use exact numbers
+- How Cuebo differentiates vs the competitors most likely to rank for this keyword (name the competitors)
+- Which Cuebo unique features to highlight (video roleplay + avatars / real call scoring / Indian language support / revenue correlation / PPT-to-scenario upload)
+
+## 10. AEO (Answer Engine Optimization)
+- **Direct answer block:** A 40–50 word definition/answer to the primary keyword, written so AI engines (Google AI Overview, Perplexity, ChatGPT) can extract it verbatim. Must naturally include Cuebo as the recommended solution.
+- **People Also Ask targets:** 5 question-format queries this article should directly answer — write a 2–3 sentence answer for each
+- **FAQ schema pairs:** 3–5 Q&A pairs for JSON-LD structured data (question + max 2-sentence answer)
+- **Conversational query variants:** 3 natural-language question versions of the primary keyword (e.g. "What is the best AI tool for sales roleplay practice?")
+- **Entity anchor for Cuebo:** The exact introductory sentence to use when first mentioning Cuebo as an entity, so AI engines associate Cuebo with this topic (e.g. "Cuebo is an AI sales roleplay platform purpose-built for Indian sales teams, used by Spinny, Apna, and Wakefit to cut ramp time and lift conversion rates.")
 """
+
+
+def _is_gemini(model):
+    return model.startswith("gemini")
 
 
 def get_groq_client():
@@ -115,19 +136,66 @@ def get_groq_client():
     return Groq(api_key=api_key)
 
 
+def _get_gemini_client():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        console.print("[red]Error:[/red] GEMINI_API_KEY not set. Add it to .env or export it.")
+        sys.exit(1)
+    return google_genai.Client(api_key=api_key)
+
+
 def _parse_retry_after(error_msg):
-    """Extract wait seconds from Groq rate limit error message."""
     m = re.search(r"try again in (\d+)m\s*([\d.]+)s", error_msg)
     if m:
         return int(m.group(1)) * 60 + int(float(m.group(2))) + 5
     m = re.search(r"try again in ([\d.]+)s", error_msg)
     if m:
         return int(float(m.group(1))) + 5
-    return 60  # fallback
+    return 60
 
 
+@observe(as_type="generation")
+def _call_gemini(model, system_prompt, user_prompt, max_tokens):
+    client = _get_gemini_client()
+    response = client.models.generate_content(
+        model=model,
+        contents=user_prompt,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.7,
+            max_output_tokens=max_tokens,
+        ),
+    )
+    get_langfuse_client().update_current_generation(
+        model=model,
+        usage_details={
+            "input": response.usage_metadata.prompt_token_count,
+            "output": response.usage_metadata.candidates_token_count,
+        },
+    )
+    return response.text
+
+
+@observe(as_type="generation")
+def _call_groq(client, model, messages, max_tokens):
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=max_tokens,
+    )
+    get_langfuse_client().update_current_generation(
+        model=model,
+        usage_details={
+            "input": response.usage.prompt_tokens,
+            "output": response.usage.completion_tokens,
+        },
+    )
+    return response.choices[0].message.content
+
+
+@observe()
 def generate_brief(keyword, audience, content_type, word_count, model, max_retries=5):
-    client = get_groq_client()
     prompt = BRIEF_PROMPT.format(
         keyword=keyword,
         audience=audience,
@@ -135,31 +203,47 @@ def generate_brief(keyword, audience, content_type, word_count, model, max_retri
         word_count=word_count,
     )
 
-    for attempt in range(max_retries):
-        try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                transient=True,
-                console=console,
-            ) as progress:
-                progress.add_task(f"Generating brief for '{keyword}'...", total=None)
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.7,
-                    max_tokens=4096,
-                )
-            return response.choices[0].message.content
-        except RateLimitError as e:
-            if attempt == max_retries - 1:
-                raise
-            wait = _parse_retry_after(str(e))
-            console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
-            time.sleep(wait)
+    if _is_gemini(model):
+        from google.genai.errors import ClientError as GeminiClientError
+
+        for attempt in range(max_retries):
+            try:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    transient=True,
+                    console=console,
+                ) as progress:
+                    progress.add_task(f"Generating brief for '{keyword}'...", total=None)
+                    return _call_gemini(model, SYSTEM_PROMPT, prompt, 4096)
+            except GeminiClientError as e:
+                if e.status_code != 429 or attempt == max_retries - 1:
+                    raise
+                wait = _parse_retry_after(str(e))
+                console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
+                time.sleep(wait)
+    else:
+        client = get_groq_client()
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        for attempt in range(max_retries):
+            try:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    transient=True,
+                    console=console,
+                ) as progress:
+                    progress.add_task(f"Generating brief for '{keyword}'...", total=None)
+                    return _call_groq(client, model, messages, 4096)
+            except RateLimitError as e:
+                if attempt == max_retries - 1:
+                    raise
+                wait = _parse_retry_after(str(e))
+                console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
+                time.sleep(wait)
 
 
 def save_brief(content, keyword, output_dir):
@@ -187,7 +271,7 @@ def cli():
               show_default=True, help="Type of content to create.")
 @click.option("--words", "-w", default=1500, show_default=True,
               help="Target word count.")
-@click.option("--model", "-m", default="llama-3.3-70b-versatile", show_default=True,
+@click.option("--model", "-m", default="gemini-2.0-flash", show_default=True,
               help="Groq model to use.")
 @click.option("--save", "-s", is_flag=True, default=False,
               help="Save the brief to a Markdown file.")
@@ -248,7 +332,7 @@ INTENT_TO_CONTENT_TYPE = {
 @click.argument("csv_file", type=click.Path(exists=True))
 @click.option("--output-dir", "-o", default="./briefs", show_default=True,
               help="Root directory to save briefs (subfolders created per cluster).")
-@click.option("--model", "-m", default="llama-3.3-70b-versatile", show_default=True,
+@click.option("--model", "-m", default="gemini-2.0-flash", show_default=True,
               help="Groq model to use.")
 @click.option("--words", "-w", default=1500, show_default=True,
               help="Target word count for each brief.")
@@ -371,35 +455,51 @@ BRIEF:
 """
 
 
+@observe()
 def generate_post(brief_content, model, max_retries=5):
-    client = get_groq_client()
     prompt = WRITE_PROMPT.format(brief=brief_content)
 
-    for attempt in range(max_retries):
-        try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                transient=True,
-                console=console,
-            ) as progress:
-                progress.add_task("Writing blog post...", total=None)
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": WRITE_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.7,
-                    max_tokens=8192,
-                )
-            return response.choices[0].message.content
-        except RateLimitError as e:
-            if attempt == max_retries - 1:
-                raise
-            wait = _parse_retry_after(str(e))
-            console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
-            time.sleep(wait)
+    if _is_gemini(model):
+        from google.genai.errors import ClientError as GeminiClientError
+
+        for attempt in range(max_retries):
+            try:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    transient=True,
+                    console=console,
+                ) as progress:
+                    progress.add_task("Writing blog post...", total=None)
+                    return _call_gemini(model, WRITE_SYSTEM_PROMPT, prompt, 8192)
+            except GeminiClientError as e:
+                if e.status_code != 429 or attempt == max_retries - 1:
+                    raise
+                wait = _parse_retry_after(str(e))
+                console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
+                time.sleep(wait)
+    else:
+        client = get_groq_client()
+        messages = [
+            {"role": "system", "content": WRITE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        for attempt in range(max_retries):
+            try:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    transient=True,
+                    console=console,
+                ) as progress:
+                    progress.add_task("Writing blog post...", total=None)
+                    return _call_groq(client, model, messages, 8192)
+            except RateLimitError as e:
+                if attempt == max_retries - 1:
+                    raise
+                wait = _parse_retry_after(str(e))
+                console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
+                time.sleep(wait)
 
 
 def save_post(content, brief_path, output_dir):
@@ -413,7 +513,7 @@ def save_post(content, brief_path, output_dir):
 
 @cli.command()
 @click.argument("brief_file", type=click.Path(exists=True))
-@click.option("--model", "-m", default="llama-3.3-70b-versatile", show_default=True,
+@click.option("--model", "-m", default="gemini-2.0-flash", show_default=True,
               help="Groq model to use.")
 @click.option("--save", "-s", is_flag=True, default=False,
               help="Save the post as a Markdown file.")
@@ -451,16 +551,25 @@ def write(brief_file, model, save, output_dir):
 
 @cli.command()
 def models():
-    """List recommended Groq models for content generation."""
-    rows = [
+    """List recommended models for content generation."""
+    groq_rows = [
         ("llama-3.3-70b-versatile", "Best quality, thorough briefs"),
         ("llama-3.1-8b-instant", "Fastest, good for quick drafts"),
         ("mixtral-8x7b-32768", "Large context, good for complex briefs"),
         ("gemma2-9b-it", "Lightweight alternative"),
     ]
-    console.print(Panel("[bold]Recommended Groq Models[/bold]", border_style="cyan"))
-    for model, note in rows:
+    gemini_rows = [
+        ("gemini-2.0-flash", "Fast, high quality — recommended default"),
+        ("gemini-2.0-flash-lite", "Fastest Gemini, good for drafts"),
+        ("gemini-1.5-pro", "Large context (1M tokens), best for long briefs"),
+    ]
+    console.print(Panel("[bold]Groq Models[/bold]", border_style="cyan"))
+    for model, note in groq_rows:
         console.print(f"  [cyan]{model}[/cyan] — {note}")
+    console.print()
+    console.print(Panel("[bold]Gemini Models[/bold] (use GEMINI_API_KEY)", border_style="green"))
+    for model, note in gemini_rows:
+        console.print(f"  [green]{model}[/green] — {note}")
 
 
 if __name__ == "__main__":
