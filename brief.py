@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """CLI tool to generate SEO content briefs using Groq or Gemini."""
 
-import os
-import sys
 import json
 import csv
 from pathlib import Path
 from datetime import datetime
 
-import re
-import time
-
 import click
 from dotenv import load_dotenv
-from groq import Groq, RateLimitError
-from google import genai as google_genai
-from google.genai import types as genai_types
-from langfuse import observe, get_client as get_langfuse_client
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
-from rich.progress import Progress, SpinnerColumn, TextColumn
+
+from agents.llm import (
+    _is_gemini,
+    get_groq_client,
+    gemini_generate,
+    groq_generate,
+    observe,
+)
 
 load_dotenv()
 console = Console()
@@ -124,75 +122,6 @@ The brief must include:
 """
 
 
-def _is_gemini(model):
-    return model.startswith("gemini")
-
-
-def get_groq_client():
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        console.print("[red]Error:[/red] GROQ_API_KEY not set. Add it to .env or export it.")
-        sys.exit(1)
-    return Groq(api_key=api_key)
-
-
-def _get_gemini_client():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        console.print("[red]Error:[/red] GEMINI_API_KEY not set. Add it to .env or export it.")
-        sys.exit(1)
-    return google_genai.Client(api_key=api_key)
-
-
-def _parse_retry_after(error_msg):
-    m = re.search(r"try again in (\d+)m\s*([\d.]+)s", error_msg)
-    if m:
-        return int(m.group(1)) * 60 + int(float(m.group(2))) + 5
-    m = re.search(r"try again in ([\d.]+)s", error_msg)
-    if m:
-        return int(float(m.group(1))) + 5
-    return 60
-
-
-@observe(as_type="generation")
-def _call_gemini(model, system_prompt, user_prompt, max_tokens):
-    client = _get_gemini_client()
-    response = client.models.generate_content(
-        model=model,
-        contents=user_prompt,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.7,
-            max_output_tokens=max_tokens,
-        ),
-    )
-    get_langfuse_client().update_current_generation(
-        model=model,
-        usage_details={
-            "input": response.usage_metadata.prompt_token_count,
-            "output": response.usage_metadata.candidates_token_count,
-        },
-    )
-    return response.text
-
-
-@observe(as_type="generation")
-def _call_groq(client, model, messages, max_tokens):
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.7,
-        max_tokens=max_tokens,
-    )
-    get_langfuse_client().update_current_generation(
-        model=model,
-        usage_details={
-            "input": response.usage.prompt_tokens,
-            "output": response.usage.completion_tokens,
-        },
-    )
-    return response.choices[0].message.content
-
 
 @observe()
 def generate_brief(keyword, audience, content_type, word_count, model, max_retries=5):
@@ -202,48 +131,16 @@ def generate_brief(keyword, audience, content_type, word_count, model, max_retri
         content_type=content_type,
         word_count=word_count,
     )
-
+    label = f"Generating brief for '{keyword}'..."
     if _is_gemini(model):
-        from google.genai.errors import ClientError as GeminiClientError
-
-        for attempt in range(max_retries):
-            try:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    transient=True,
-                    console=console,
-                ) as progress:
-                    progress.add_task(f"Generating brief for '{keyword}'...", total=None)
-                    return _call_gemini(model, SYSTEM_PROMPT, prompt, 4096)
-            except GeminiClientError as e:
-                if e.status_code != 429 or attempt == max_retries - 1:
-                    raise
-                wait = _parse_retry_after(str(e))
-                console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
-                time.sleep(wait)
+        return gemini_generate(model, SYSTEM_PROMPT, prompt, 4096, label, max_retries)
     else:
         client = get_groq_client()
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        for attempt in range(max_retries):
-            try:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    transient=True,
-                    console=console,
-                ) as progress:
-                    progress.add_task(f"Generating brief for '{keyword}'...", total=None)
-                    return _call_groq(client, model, messages, 4096)
-            except RateLimitError as e:
-                if attempt == max_retries - 1:
-                    raise
-                wait = _parse_retry_after(str(e))
-                console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
-                time.sleep(wait)
+        return groq_generate(client, model, messages, 4096, label, max_retries)
 
 
 def save_brief(content, keyword, output_dir):
@@ -458,48 +355,15 @@ BRIEF:
 @observe()
 def generate_post(brief_content, model, max_retries=5):
     prompt = WRITE_PROMPT.format(brief=brief_content)
-
     if _is_gemini(model):
-        from google.genai.errors import ClientError as GeminiClientError
-
-        for attempt in range(max_retries):
-            try:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    transient=True,
-                    console=console,
-                ) as progress:
-                    progress.add_task("Writing blog post...", total=None)
-                    return _call_gemini(model, WRITE_SYSTEM_PROMPT, prompt, 8192)
-            except GeminiClientError as e:
-                if e.status_code != 429 or attempt == max_retries - 1:
-                    raise
-                wait = _parse_retry_after(str(e))
-                console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
-                time.sleep(wait)
+        return gemini_generate(model, WRITE_SYSTEM_PROMPT, prompt, 8192, "Writing blog post...", max_retries)
     else:
         client = get_groq_client()
         messages = [
             {"role": "system", "content": WRITE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        for attempt in range(max_retries):
-            try:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    transient=True,
-                    console=console,
-                ) as progress:
-                    progress.add_task("Writing blog post...", total=None)
-                    return _call_groq(client, model, messages, 8192)
-            except RateLimitError as e:
-                if attempt == max_retries - 1:
-                    raise
-                wait = _parse_retry_after(str(e))
-                console.print(f"  [yellow]Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries - 1}...[/yellow]")
-                time.sleep(wait)
+        return groq_generate(client, model, messages, 8192, "Writing blog post...", max_retries)
 
 
 def save_post(content, brief_path, output_dir):
@@ -570,6 +434,182 @@ def models():
     console.print(Panel("[bold]Gemini Models[/bold] (use GEMINI_API_KEY)", border_style="green"))
     for model, note in gemini_rows:
         console.print(f"  [green]{model}[/green] — {note}")
+
+
+def _keyword_to_slug(keyword: str) -> str:
+    return keyword.lower().replace(" ", "-").replace("/", "-")
+
+
+def _find_latest_brief(slug: str, briefs_dir: Path):
+    """Return the most recently modified brief-{slug}-*.md anywhere under briefs_dir."""
+    matches = sorted(briefs_dir.rglob(f"brief-{slug}-*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0] if matches else None
+
+
+def _find_latest_blog(slug: str, output_dir: Path):
+    """Return (blog_path, run_dir) for the most recently modified blog under output_dir/{slug}-*/."""
+    matches = sorted(output_dir.glob(f"{slug}-*/blog.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if matches:
+        return matches[0], matches[0].parent
+    return None, None
+
+
+def _make_run_dir(slug: str, output_dir: Path) -> Path:
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    run_dir = output_dir / f"{slug}-{date_str}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+@cli.command()
+@click.argument("keyword")
+@click.option("--output-dir", "-o", default="./output", show_default=True,
+              help="Root directory for output files.")
+@click.option("--briefs-dir", default="./briefs", show_default=True,
+              help="Directory to search for existing briefs.")
+def blog(keyword, output_dir, briefs_dir):
+    """Generate a blog post for KEYWORD using gemini-2.5-pro.
+
+    Finds an existing brief under BRIEFS_DIR, or generates one first.
+    Saves blog.md (and brief.md if newly generated) to OUTPUT_DIR/{slug}-{date}/.
+
+    \b
+    Examples:
+      brief blog "ai sales roleplay"
+      brief blog "sales coaching" --briefs-dir ./briefs
+    """
+    from agents.blog_agent import generate_blog, save_blog
+
+    slug = _keyword_to_slug(keyword)
+    run_dir = _make_run_dir(slug, Path(output_dir))
+
+    brief_path = _find_latest_brief(slug, Path(briefs_dir))
+    if brief_path:
+        console.print(f"[dim]Using existing brief:[/dim] {brief_path}")
+        brief_content = brief_path.read_text(encoding="utf-8")
+    else:
+        console.print(f"[yellow]No brief found for '{keyword}' — generating one first...[/yellow]")
+        brief_content = generate_brief(keyword, "general audience", "blog post", 1500, "gemini-2.0-flash")
+        brief_out = run_dir / "brief.md"
+        brief_out.write_text(brief_content, encoding="utf-8")
+        console.print(f"  [green]Brief saved:[/green] {brief_out}")
+
+    console.print(Panel(
+        f"[bold]Keyword:[/bold] {keyword}\n"
+        f"[bold]Model:[/bold] gemini-2.5-pro\n"
+        f"[bold]Output:[/bold] {run_dir}",
+        title="[cyan]Blog Agent[/cyan]",
+        border_style="cyan",
+    ))
+
+    blog_content = generate_blog(brief_content)
+    path = save_blog(blog_content, slug, run_dir)
+    console.print(f"\n[green]Blog saved:[/green] {path}")
+
+
+@cli.command()
+@click.argument("keyword")
+@click.option("--output-dir", "-o", default="./output", show_default=True,
+              help="Root directory to search for existing blog files.")
+def banner(keyword, output_dir):
+    """Generate an SVG banner from an existing blog post for KEYWORD.
+
+    Requires a blog.md already generated by `brief blog`. Saves banner.svg
+    to the same run directory as the blog.
+
+    \b
+    Examples:
+      brief banner "ai sales roleplay"
+    """
+    from agents.banner_agent import extract_frontmatter, generate_banner, save_banner
+
+    slug = _keyword_to_slug(keyword)
+    blog_path, run_dir = _find_latest_blog(slug, Path(output_dir))
+
+    if not blog_path:
+        console.print(
+            f"[red]No blog found for '{keyword}'.[/red] "
+            f"Run [bold]brief blog \"{keyword}\"[/bold] first."
+        )
+        raise SystemExit(1)
+
+    console.print(f"[dim]Using blog:[/dim] {blog_path}")
+    blog_content = blog_path.read_text(encoding="utf-8")
+    fm = extract_frontmatter(blog_content)
+
+    blog_title = fm.get("title", keyword)
+    primary_keyword = fm.get("primary_keyword", keyword)
+    # Derive a short label tag from the primary keyword (first 3 words max)
+    label_tag = " ".join(primary_keyword.split()[:3]).title()
+
+    console.print(Panel(
+        f"[bold]Title:[/bold] {blog_title}\n"
+        f"[bold]Keyword:[/bold] {primary_keyword}\n"
+        f"[bold]Label:[/bold] {label_tag}\n"
+        f"[bold]Model:[/bold] gemini-2.5-pro\n"
+        f"[bold]Output:[/bold] {run_dir}",
+        title="[cyan]Banner Agent[/cyan]",
+        border_style="cyan",
+    ))
+
+    svg_content = generate_banner(blog_title, primary_keyword, label_tag)
+    path = save_banner(svg_content, run_dir)
+    console.print(f"\n[green]Banner saved:[/green] {path}")
+
+
+@cli.command()
+@click.argument("keyword")
+@click.option("--output-dir", "-o", default="./output", show_default=True,
+              help="Root directory for all output files.")
+def full(keyword, output_dir):
+    """Run the full pipeline for KEYWORD: brief → blog → banner.
+
+    Saves brief.md, blog.md, and banner.svg to OUTPUT_DIR/{slug}-{date}/.
+
+    \b
+    Examples:
+      brief full "ai sales roleplay"
+      brief full "sales coaching" --output-dir ./campaigns
+    """
+    from agents.blog_agent import generate_blog, save_blog
+    from agents.banner_agent import extract_frontmatter, generate_banner, save_banner
+
+    slug = _keyword_to_slug(keyword)
+    run_dir = _make_run_dir(slug, Path(output_dir))
+
+    console.print(Panel(
+        f"[bold]Keyword:[/bold] {keyword}\n"
+        f"[bold]Pipeline:[/bold] brief (gemini-2.0-flash) → blog (gemini-2.5-pro) → banner (gemini-2.5-pro)\n"
+        f"[bold]Output:[/bold] {run_dir}",
+        title="[cyan]Full Pipeline[/cyan]",
+        border_style="cyan",
+    ))
+
+    # Step 1: Brief
+    console.print("\n[bold][1/3] Generating brief...[/bold]")
+    brief_content = generate_brief(keyword, "general audience", "blog post", 1500, "gemini-2.0-flash")
+    brief_path = run_dir / "brief.md"
+    brief_path.write_text(brief_content, encoding="utf-8")
+    console.print(f"  [green]Saved:[/green] {brief_path}")
+
+    # Step 2: Blog
+    console.print("\n[bold][2/3] Generating blog post...[/bold]")
+    blog_content = generate_blog(brief_content)
+    blog_path = save_blog(blog_content, slug, run_dir)
+    console.print(f"  [green]Saved:[/green] {blog_path}")
+
+    # Step 3: Banner
+    console.print("\n[bold][3/3] Generating SVG banner...[/bold]")
+    fm = extract_frontmatter(blog_content)
+    blog_title = fm.get("title", keyword)
+    primary_keyword = fm.get("primary_keyword", keyword)
+    label_tag = " ".join(primary_keyword.split()[:3]).title()
+
+    svg_content = generate_banner(blog_title, primary_keyword, label_tag)
+    banner_path = save_banner(svg_content, run_dir)
+    console.print(f"  [green]Saved:[/green] {banner_path}")
+
+    console.print(f"\n[bold green]Done.[/bold green] All files saved to {run_dir}")
 
 
 if __name__ == "__main__":
