@@ -585,12 +585,20 @@ def full(keyword, output_dir):
         border_style="cyan",
     ))
 
-    # Step 1: Brief
-    console.print("\n[bold][1/3] Generating brief...[/bold]")
-    brief_content = generate_brief(keyword, "general audience", "blog post", 1500, "gemini-2.0-flash")
-    brief_path = run_dir / "brief.md"
-    brief_path.write_text(brief_content, encoding="utf-8")
-    console.print(f"  [green]Saved:[/green] {brief_path}")
+    # Step 1: Brief — reuse existing if found
+    console.print("\n[bold][1/3] Brief...[/bold]")
+    existing_brief = _find_latest_brief(slug, Path("./briefs"))
+    if existing_brief:
+        console.print(f"  [dim]Using existing brief:[/dim] {existing_brief}")
+        brief_content = existing_brief.read_text(encoding="utf-8")
+        brief_path = run_dir / "brief.md"
+        brief_path.write_text(brief_content, encoding="utf-8")
+        console.print(f"  [green]Copied:[/green] {brief_path}")
+    else:
+        brief_content = generate_brief(keyword, "general audience", "blog post", 1500, "gemini-2.0-flash")
+        brief_path = run_dir / "brief.md"
+        brief_path.write_text(brief_content, encoding="utf-8")
+        console.print(f"  [green]Saved:[/green] {brief_path}")
 
     # Step 2: Blog
     console.print("\n[bold][2/3] Generating blog post...[/bold]")

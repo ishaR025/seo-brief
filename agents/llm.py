@@ -109,7 +109,7 @@ def gemini_generate(
                 progress.add_task(task_label, total=None)
                 return _call_gemini(model, system_prompt, user_prompt, max_tokens)
         except GeminiClientError as e:
-            if e.status_code != 429 or attempt == max_retries - 1:
+            if e.code != 429 or attempt == max_retries - 1:
                 raise
             wait = _parse_retry_after(str(e))
             _console.print(
