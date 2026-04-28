@@ -1,8 +1,12 @@
 .env
 __pycache__/
+**/__pycache__/
 *.pyc
 .claude/
 keywords.csv
+venv/
+output/
 briefs/**
 !briefs/examples/
 !briefs/examples/**
+seo_brief.egg-info/

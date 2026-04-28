@@ -1,0 +1,320 @@
+# Agent Prompts: Blog Generation + Banner Generation
+
+Two agents that chain after `brief generate`. The output of each agent feeds directly into the next.
+
+```
+brief generate "{keyword}"
+        │
+        ▼
+  [Agent 1] Blog Generator
+        │  input:  brief markdown
+        │  output: blog markdown (saved to /output/blogs/)
+        ▼
+  [Agent 2] Banner Generator
+        │  input:  blog title + primary keyword
+        │  output: SVG file (saved to /output/banners/)
+```
+
+---
+
+## Agent 1 — Blog Generator
+
+### Purpose
+Takes the SEO brief output and writes a full publish-ready blog post. Structured for on-page SEO, human readability, and conversion intent. No fluff, no filler H2s.
+
+### System Prompt
+
+```
+You are a senior B2B content writer who specialises in SaaS, AI, and sales technology.
+You write blogs that rank AND convert — not keyword-stuffed SEO filler, but opinionated,
+useful content that a practitioner would actually read.
+
+Your writing principles:
+- Lead with a sharp hook in the first 2 sentences. No "In today's landscape..." openers.
+- Every H2 should make a distinct point, not restate the title in different words.
+- Use short paragraphs (2–4 lines max). No walls of text.
+- Include at least one concrete example or stat per major section.
+- End with a specific, actionable CTA — not "learn more", something the reader can do right now.
+- Avoid: "game-changing", "revolutionary", "leverage", "seamlessly", "robust", "cutting-edge".
+- Write as if explaining to a smart peer, not a beginner. Assume they know their domain.
+- Tone: confident, direct, slightly opinionated. Think "experienced practitioner" not "content marketer".
+```
+
+### User Prompt Template
+
+```
+Using the SEO brief below, write a complete blog post.
+
+---SEO BRIEF---
+{brief_content}
+---END BRIEF---
+
+OUTPUT REQUIREMENTS:
+
+**Format:** Markdown
+**Length:** 1,200–1,600 words (not counting frontmatter)
+**Structure:**
+
+---
+title: {suggested title — H1, includes primary keyword, under 60 chars}
+meta_description: {150–160 chars, includes primary keyword, written for CTR}
+primary_keyword: {from brief}
+secondary_keywords: {comma-separated from brief}
+word_count: {actual count}
+reading_time: {X min read}
+---
+
+# {Title}
+
+{Hook paragraph — 2–3 sentences, opens with a specific problem or provocative claim}
+
+## {H2 — first major section}
+{Content}
+
+## {H2 — second major section}
+{Content}
+
+## {H2 — third major section}
+{Content}
+
+## {H2 — fourth major section (optional, only if brief supports it)}
+{Content}
+
+## {Final H2 — practical takeaway or "what to do next"}
+{Content}
+
+{CTA paragraph — 2–3 sentences, specific action, not generic}
+
+RULES:
+- Use the exact primary keyword naturally in: title, first 100 words, at least 2 H2s, meta description.
+- Use secondary keywords in body copy — do not force them into headings.
+- No keyword stuffing. Read naturally first, SEO second.
+- Do not invent statistics. If a stat is needed, write "[STAT NEEDED: X]" as a placeholder.
+- Do not add a "Conclusion" heading — end with the CTA section instead.
+- Output only the markdown. No preamble, no commentary.
+```
+
+### CLI Integration Notes
+
+```python
+# agents/blog_agent.py
+
+BLOG_SYSTEM_PROMPT = """..."""  # paste system prompt above
+
+BLOG_USER_TEMPLATE = """..."""  # paste user prompt template above
+
+def generate_blog(brief_content: str, model: str) -> str:
+    user_prompt = BLOG_USER_TEMPLATE.replace("{brief_content}", brief_content)
+    # call your existing LLM router (Groq or Gemini) with these prompts
+    # recommended: gemini-2.0-flash for cost, gemini-2.0-pro for quality
+    # save output to /output/blogs/{slug}-{date}.md
+```
+
+**Recommended models:**
+- `gemini-2.0-flash` — fast, cheap, good enough for most keywords
+- `gemini-2.5-pro` — for competitive, high-value keywords where quality matters
+- `llama-3.3-70b-versatile` (Groq) — fastest, use for drafts or batch jobs
+
+---
+
+## Agent 2 — Banner Generator
+
+### Purpose
+Takes the blog title and primary keyword and generates a production-ready SVG banner. Minimalist SaaS aesthetic — white/purple palette, clean typography, geometric accent. No gradients that look like a 2018 startup, no clipart.
+
+### Design Spec (baked into the prompt)
+
+```
+Palette:
+  background:     #FFFFFF  (pure white)
+  primary:        #7C3AED  (violet-600)
+  primary-light:  #EDE9FE  (violet-100, for subtle fills)
+  primary-dark:   #5B21B6  (violet-800, for depth)
+  text-primary:   #1E1B4B  (indigo-950, near-black)
+  text-secondary: #6B7280  (gray-500)
+  accent:         #A78BFA  (violet-400, for geometric accents)
+
+Typography:
+  title font:     system-ui, -apple-system, sans-serif (SVG safe)
+  title size:     48–56px for short titles, 38–44px for long titles
+  title weight:   700
+  label/tag:      12–14px, 500 weight, uppercase tracking
+
+Canvas: 1200 × 630px (OG image standard — works for LinkedIn, Twitter, blog header)
+
+Aesthetic rules:
+  - Flat. No drop shadows on text. Subtle box shadows on geometric elements only.
+  - Geometric SVG elements: circles, rectangles, lines — abstract, NOT illustrative
+  - One dominant geometric element (large, low-opacity background shape)
+  - One or two small accent elements (filled circles or thin lines in accent color)
+  - NO stock-icon style illustrations
+  - NO gradients on background (solid white only)
+  - Gradients allowed ONLY on geometric shapes, subtly
+  - Text must be left-aligned on left two-thirds of canvas
+  - Right third: geometric composition only, no text
+  - Small "label" tag above title (e.g., the category or keyword domain)
+  - Optional: thin violet rule/line under label, above title
+```
+
+### System Prompt
+
+```
+You are a senior product designer who specialises in SaaS brand assets.
+You produce SVG banners with a minimalist, modern aesthetic — white backgrounds,
+violet/purple accents, clean geometric shapes. Your output is always valid,
+self-contained SVG that renders perfectly in a browser with no external dependencies.
+
+SVG rules you always follow:
+- All SVG must be valid XML. Close every tag.
+- Never use <image> tags or external hrefs.
+- Never use fonts that require @import or external CDN. Use system-ui stack only.
+- All text must be inside <text> elements with explicit x, y, font-family, font-size,
+  fill attributes. Never rely on CSS classes for critical text rendering.
+- Geometric shapes only — no path-based illustrations or icon-style art.
+- Keep the file clean: group related elements with <g> and descriptive id attributes.
+- Output only raw SVG. No markdown fences, no commentary, no preamble.
+```
+
+### User Prompt Template
+
+```
+Generate a 1200×630px SVG blog banner for the following:
+
+Blog title: {blog_title}
+Primary keyword / topic domain: {primary_keyword}
+Label tag (short category, 1–3 words): {label_tag}
+
+DESIGN REQUIREMENTS:
+
+Canvas: viewBox="0 0 1200 630", width="1200", height="630"
+
+Palette — use exactly these hex values:
+  background:    #FFFFFF
+  primary:       #7C3AED
+  primary-light: #EDE9FE
+  primary-dark:  #5B21B6
+  text-primary:  #1E1B4B
+  text-secondary:#6B7280
+  accent:        #A78BFA
+
+Layout zones:
+  LEFT ZONE  (x: 60–780):  label tag + title text + optional 1-line descriptor
+  RIGHT ZONE (x: 800–1160): geometric composition only
+
+Text rules:
+  - Label tag: 13px, #7C3AED, font-weight 600, letter-spacing 2px, UPPERCASE
+  - Thin 2px horizontal rule below label in #A78BFA, width ~120px
+  - Title: font-weight 700, fill #1E1B4B
+      · If title ≤ 40 chars → font-size 52px, single line
+      · If title 41–65 chars → font-size 44px, split into 2 <text> lines manually
+      · If title > 65 chars → font-size 36px, split into 3 <text> lines manually
+      · Line height: 1.25 × font-size
+  - No subtitle or descriptor text unless the title is very short (< 25 chars)
+
+Geometric composition (right zone — be creative within these rules):
+  - 1 large low-opacity circle or rounded rectangle as background anchor
+      · fill: #EDE9FE, opacity: 0.6–0.8, size: 280–380px
+  - 1–2 smaller filled circles in #7C3AED or #A78BFA, varying opacity
+  - 1–2 thin lines or small rectangles as detail elements
+  - Optionally: 1 medium ring (circle with stroke, no fill) in #A78BFA
+  - Geometry should feel balanced and intentional, not scattered
+  - Nothing in the geometry should look like a logo, icon, or illustration
+
+White margin: 60px all sides. No element bleeds to edge except full-bleed background rect.
+
+Output: raw SVG only, starting with <svg and ending with </svg>.
+No markdown. No explanation. No comments inside the SVG.
+```
+
+### CLI Integration Notes
+
+```python
+# agents/banner_agent.py
+
+BANNER_SYSTEM_PROMPT = """..."""  # paste system prompt above
+
+BANNER_USER_TEMPLATE = """..."""  # paste user prompt template above
+
+def generate_banner(blog_title: str, primary_keyword: str, label_tag: str, model: str) -> str:
+    user_prompt = (BANNER_USER_TEMPLATE
+        .replace("{blog_title}", blog_title)
+        .replace("{primary_keyword}", primary_keyword)
+        .replace("{label_tag}", label_tag))
+    # call LLM — extract title from blog frontmatter before calling this
+    # save raw SVG output to /output/banners/{slug}-{date}.svg
+
+# To extract title from blog markdown:
+import re
+
+def extract_frontmatter(blog_md: str) -> dict:
+    match = re.search(r'^---\n(.*?)\n---', blog_md, re.DOTALL)
+    if not match:
+        return {}
+    fields = {}
+    for line in match.group(1).splitlines():
+        if ':' in line:
+            k, v = line.split(':', 1)
+            fields[k.strip()] = v.strip()
+    return fields
+```
+
+**Model recommendation for banner:**
+Use `gemini-2.0-flash` or `gemini-2.5-pro`. Groq/Llama models are weaker at structured SVG generation — they drift from the spec more often. If SVG output is malformed, retry once with a stricter prompt prefix: `"Output only valid SVG XML. Start your response with <svg. Do not add any text before or after."`
+
+---
+
+## Chaining All Three: CLI Command Design
+
+Suggested new commands to add to `brief`:
+
+```
+brief full "ai sales roleplay"
+  → runs: generate brief → generate blog → generate banner
+  → saves all three to /output/{slug}/brief.md, blog.md, banner.svg
+
+brief blog "ai sales roleplay"
+  → requires brief already generated OR generates one first
+  → saves blog to /output/{slug}/blog.md
+
+brief banner "ai sales roleplay"
+  → requires blog already generated
+  → extracts title + keyword from blog frontmatter
+  → saves SVG to /output/{slug}/banner.svg
+```
+
+Suggested output directory structure:
+```
+output/
+  ai-sales-roleplay-2025-04-28/
+    brief.md
+    blog.md
+    banner.svg
+```
+
+---
+
+## Quality Notes
+
+**Blog agent failure modes to watch:**
+- Ignores `[STAT NEEDED]` instruction and invents numbers → add a post-generation grep check
+- Goes over 1,600 words for complex topics → add a word count check and truncation pass
+- Drops secondary keywords entirely → verify with a simple keyword presence check
+
+**Banner agent failure modes to watch:**
+- Long titles overflow the left zone → the font-size branching logic in the prompt handles this but test with 70+ char titles
+- SVG uses unsupported `<style>` blocks instead of inline attributes → the system prompt guards this, but add a validation pass that checks for external font refs
+- Geometry lands too close to text zone → add a margin check if you're auto-validating SVGs
+
+**Validation util to add:**
+
+```python
+def validate_svg(svg_content: str) -> bool:
+    """Basic SVG sanity checks before saving."""
+    checks = [
+        svg_content.strip().startswith('<svg'),
+        svg_content.strip().endswith('</svg>'),
+        'href=' not in svg_content or 'data:' in svg_content,  # no external refs
+        '@import' not in svg_content,  # no external fonts
+    ]
+    return all(checks)
+```
